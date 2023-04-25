@@ -8,12 +8,12 @@ export PGDATA=$SRC_DIR/pgdata
 # cleanup required when building variants
 rm -rf $PGDATA
 
-pg_ctl initdb
+initdb -D $PGDATA
 
 # ensure that the gzip extension is loaded at process startup
 echo "shared_preload_libraries = 'vector'" >> $PGDATA/postgresql.conf
 
-pg_ctl start -l $PGDATA/log.txt
+pg_ctl start -D $PGDAT -l $PGDATA/log.txt -o "-p $PGPORT"
 
 # wait a few seconds just to make sure that the server has started
 sleep 2
@@ -23,6 +23,6 @@ make installcheck        # regression tests
 check_result=$?
 set -e
 
-pg_ctl stop
+pg_ctl stop -D $PGDAT
 
 exit $check_result
