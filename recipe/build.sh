@@ -13,7 +13,7 @@ initdb -D $PGDATA
 # ensure that the gzip extension is loaded at process startup
 echo "shared_preload_libraries = 'vector'" >> $PGDATA/postgresql.conf
 
-pg_ctl start -D $PGDAT -l $PGDATA/log.txt -o "-p $PGPORT"
+pg_ctl -D $PGDAT -l $PGDATA/log.txt -o "-p $PGPORT" start
 
 # wait a few seconds just to make sure that the server has started
 sleep 2
@@ -23,6 +23,6 @@ make installcheck        # regression tests
 check_result=$?
 set -e
 
-pg_ctl stop -D $PGDAT
+pg_ctl -D $PGDAT stop
 
 exit $check_result
