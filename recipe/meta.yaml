@@ -1,0 +1,74 @@
+{% set name = "pgvector-postgresql" %}
+{% set version = "0.4.1" %}
+
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  git_url: https://github.com/motoharu-yano/pgvector.git
+  git_tag: master
+
+build:
+  number: 0
+
+requirements:
+  build:
+    - python {{ python }}                # [build_platform != target_platform]
+    - cross-python_{{ target_platform }} # [build_platform != target_platform]
+    - numpy                              # [build_platform != target_platform]
+    - {{ compiler('c') }}
+    - {{ compiler('cxx') }}
+    - cmake
+    - jom   [win]
+    - make   [unix]
+    - pkg-config   [unix]
+  host:
+    - python {{ python }}
+    - freetype
+    - tzcode          # [not win]
+    - tzdata          # [not win]
+    # you need to make sure that conda-forge is added as lower priority channel
+    # in this case build will take postgresql from conda-forge because dependent postgresql-plpython is only on conda-forge
+    # other packages will be taken from default channels as usual
+    # replacing channel with conda build -c conda-forge does not work
+    # it forces this channel for all the packages and cartridge fails to pass the tests
+    - postgresql {{ postgresql }}
+    - postgresql-plpython
+    # msys chunk with make for windows build
+    - msys2-conda-epoch >=20160418 [win]
+    - m2-msys2-runtime [win]
+    - m2-libiconv [win]
+    - m2-libintl [win]
+    - m2-diffutils [win]
+    - m2-patch [win]
+  run:
+    # drag python into dependencies - python version is needed for plpython
+    # postgresql-plpython is also dragged into dependencies - better to install all extensions together with postgresql
+    - python {{ python }}
+    # you need to make sure that conda-forge is added as lower priority channel
+    # in this case build will take postgresql from conda-forge because dependent postgresql-plpython is only on conda-forge
+    # other packages will be taken from default channels as usual
+    # replacing channel with conda build -c conda-forge does not work
+    # it forces this channel for all the packages and cartridge fails to pass the tests
+    - postgresql {{ postgresql }}
+    - postgresql-plpython
+    - freetype
+    - tzcode          # [not win]
+    - tzdata          # [not win]
+
+outputs:
+  - name: pgvector-postgresql
+
+about:
+  home: https://github.com/pgvector/pgvector
+  license: MIT License
+  license_file: LICENSE
+  summary: pgvector extension for postgresql. includes conda-forge version of postgresql and postgresql-plpython extension
+  doc_url: https://github.com/motoharu-yano/pgvector/blob/master/README.md
+  dev_url: https://github.com/motoharu-yano/pgvector
+
+extra:
+  recipe-maintainers:
+    - motoharu-yano
