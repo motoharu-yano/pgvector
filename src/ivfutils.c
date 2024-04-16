@@ -1,21 +1,28 @@
 #include "postgres.h"
 
+#include "access/generic_xlog.h"
+#include "catalog/pg_type.h"
+#include "fmgr.h"
+#include "halfutils.h"
+#include "halfvec.h"
 #include "ivfflat.h"
 #include "storage/bufmgr.h"
 #include "vector.h"
+#include "utils/syscache.h"
 
 /*
  * Allocate a vector array
  */
 VectorArray
-VectorArrayInit(int maxlen, int dimensions)
+VectorArrayInit(int maxlen, int dimensions, Size itemsize)
 {
 	VectorArray res = palloc(sizeof(VectorArrayData));
 
 	res->length = 0;
 	res->maxlen = maxlen;
 	res->dim = dimensions;
-	res->items = palloc_extended(maxlen * VECTOR_SIZE(dimensions), MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
+	res->itemsize = itemsize;
+	res->items = palloc_extended(maxlen * itemsize, MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
 	return res;
 }
 
@@ -27,18 +34,6 @@ VectorArrayFree(VectorArray arr)
 {
 	pfree(arr->items);
 	pfree(arr);
-}
-
-/*
- * Print vector array - useful for debugging
- */
-void
-PrintVectorArray(char *msg, VectorArray arr)
-{
-	int			i;
-
-	for (i = 0; i < arr->length; i++)
-		PrintVector(msg, VectorArrayGet(arr, i));
 }
 
 /*
@@ -59,12 +54,43 @@ IvfflatGetLists(Relation index)
  * Get proc
  */
 FmgrInfo *
-IvfflatOptionalProcInfo(Relation rel, uint16 procnum)
+IvfflatOptionalProcInfo(Relation index, uint16 procnum)
 {
-	if (!OidIsValid(index_getprocid(rel, 1, procnum)))
+	if (!OidIsValid(index_getprocid(index, 1, procnum)))
 		return NULL;
 
-	return index_getprocinfo(rel, 1, procnum);
+	return index_getprocinfo(index, 1, procnum);
+}
+
+/*
+ * Get type
+ */
+IvfflatType
+IvfflatGetType(Relation index)
+{
+	Oid			typid = TupleDescAttr(index->rd_att, 0)->atttypid;
+	HeapTuple	tuple;
+	Form_pg_type type;
+	IvfflatType result;
+
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for type %u", typid);
+
+	type = (Form_pg_type) GETSTRUCT(tuple);
+	if (strcmp(NameStr(type->typname), "vector") == 0)
+		result = IVFFLAT_TYPE_VECTOR;
+	else if (strcmp(NameStr(type->typname), "halfvec") == 0)
+		result = IVFFLAT_TYPE_HALFVEC;
+	else
+	{
+		ReleaseSysCache(tuple);
+		elog(ERROR, "type not supported for ivfflat index");
+	}
+
+	ReleaseSysCache(tuple);
+
+	return result;
 }
 
 /*
@@ -76,25 +102,18 @@ IvfflatOptionalProcInfo(Relation rel, uint16 procnum)
  * if it's different than the original value
  */
 bool
-IvfflatNormValue(FmgrInfo *procinfo, Oid collation, Datum *value, Vector * result)
+IvfflatNormValue(FmgrInfo *procinfo, Oid collation, Datum *value, IvfflatType type)
 {
-	Vector	   *v;
-	int			i;
-	double		norm;
-
-	norm = DatumGetFloat8(FunctionCall1Coll(procinfo, collation, *value));
+	double		norm = DatumGetFloat8(FunctionCall1Coll(procinfo, collation, *value));
 
 	if (norm > 0)
 	{
-		v = DatumGetVector(*value);
-
-		if (result == NULL)
-			result = InitVector(v->dim);
-
-		for (i = 0; i < v->dim; i++)
-			result->x[i] = v->x[i] / norm;
-
-		*value = PointerGetDatum(result);
+		if (type == IVFFLAT_TYPE_VECTOR)
+			*value = DirectFunctionCall1(l2_normalize, *value);
+		else if (type == IVFFLAT_TYPE_HALFVEC)
+			*value = DirectFunctionCall1(halfvec_l2_normalize, *value);
+		else
+			elog(ERROR, "Unsupported type");
 
 		return true;
 	}
@@ -142,7 +161,6 @@ IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogStat
 void
 IvfflatCommitBuffer(Buffer buf, GenericXLogState *state)
 {
-	MarkBufferDirty(buf);
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
 }
@@ -166,8 +184,6 @@ IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **st
 	IvfflatInitPage(newbuf, newpage);
 
 	/* Commit */
-	MarkBufferDirty(*buf);
-	MarkBufferDirty(newbuf);
 	GenericXLogFinish(*state);
 
 	/* Unlock */
@@ -179,15 +195,39 @@ IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **st
 }
 
 /*
+ * Get the metapage info
+ */
+void
+IvfflatGetMetaPageInfo(Relation index, int *lists, int *dimensions)
+{
+	Buffer		buf;
+	Page		page;
+	IvfflatMetaPage metap;
+
+	buf = ReadBuffer(index, IVFFLAT_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	metap = IvfflatPageGetMeta(page);
+
+	*lists = metap->lists;
+
+	if (dimensions != NULL)
+		*dimensions = metap->dimensions;
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
  * Update the start or insert page of a list
  */
 void
-IvfflatUpdateList(Relation index, GenericXLogState *state, ListInfo listInfo,
+IvfflatUpdateList(Relation index, ListInfo listInfo,
 				  BlockNumber insertPage, BlockNumber originalInsertPage,
 				  BlockNumber startPage, ForkNumber forkNum)
 {
 	Buffer		buf;
 	Page		page;
+	GenericXLogState *state;
 	IvfflatList list;
 	bool		changed = false;
 
